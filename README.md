@@ -15,7 +15,7 @@
 git clone --recursive -b my-extension https://github.com/anisha-ban/fast-ctc-decode-synde-primerseeker
 cd fast-ctc-decode-synde-primerseeker/
 pip install "maturin>=0.14,<0.15"
-python -m maturin build --release --features python
+python -m maturin build --release --features python # this should create a folder `target` named target with the required wheel file
 pip install target/wheels/*.whl --force-reinstall
 cd ..
 ```
@@ -25,7 +25,8 @@ cd ..
 - The original functionality (beam_search, viterbi_search, ...) are preserved and the information on the use of these functions can be found in `old-README.md`.
 
 ```python
->>> from fast_ctc_decode import primer_beam_search, convolutional_beam_search_log
+>>> from fast_ctc_decode import primer_beam_search_opt as primer_beam_search
+>>> from fast_ctc_decode import convolutional_beam_search_log
 >>> import numpy as np
 >>> import json
 >>> alphabet = "NACGT"
@@ -40,14 +41,21 @@ cd ..
                            [  0,   0,   0,  0,   1]],dtype='float32')
 
 >>> primer = "ACGT"
+>>> beam = 8
+>>> fraction_to_examine = 1.0
+>>> beam_cut_threshold = 0.0
+>>> concentration_threshold = 1.0
 >>> max_sample_depth = 6
->>> shift = 2
->>> primer_beam_search(prob_matrix, 5, 0, primer, max_sample_depth, shift)
-
+>>> shift = 2 # just for this example. normally we set this to 100
+>>> subsample = 1
+>>> primer_scores, total_comp = primer_beam_search(prob_matrix, beam, fraction_to_examine, beam_cut_threshold, concentration_threshold, primer, max_sample_depth, shift, subsample)
+>>> primer_location = np.argmax(np.array(primer_scores))
+>>> primer_location
+5
 
 >>> with open("convolutional_codes_trellises/cc_2_1_3.json") as f:
         conv_config = json.load(f)
->>> prob_matrix=np.matrix([
+>>> prob_matrix=np.matrix([ [0.0, 1.0, 0.0, 0.0, 0.0],  # A - 0
                             [0.0, 1.0, 0.0, 0.0, 0.0],  # A - 0
                             [0.0, 0.0, 0.0, 0.0, 1.0],  # T - 1
                             [0.0, 0.0, 0.0, 0.0, 1.0],  # T - 2  AT (2)
@@ -62,7 +70,7 @@ cd ..
                             [0.0, 0.0, 0.0, 0.0, 1.0],  # T - 11 ATAACCT
                             [0.0, 0.0, 1.0, 0.0, 0.0],  # C
                             [0.0, 0.0, 0.0, 1.0, 0.0],  # G
-                        ], dtype=np.float32)
+                        ], dtype='float32')
 >>> forward_primer_str = "AT"
 >>> reverse_primer_str = "CG"
 >>> offset_sequence_str = "ACACG"

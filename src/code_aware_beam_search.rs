@@ -715,7 +715,7 @@ pub fn convolutional_beam_search_log<D: Data<Elem = f32>>(
         node: ROOT_NODE,
         state: 0,
         log_gap_prob: 0.0,  // ln(1.0) = 0.0
-        log_label_prob: f32::NEG_INFINITY,  // ln(0.0) = -inf
+        log_label_prob: 0.0,  // ln(0.0) = -inf
         sequence_length: 0,
         syndrome_state: 0,  // Start in syndrome state 0
     }];
@@ -736,7 +736,8 @@ pub fn convolutional_beam_search_log<D: Data<Elem = f32>>(
                 //       best.sequence_length, best.log_probability());
         //    }
         //}
-
+        println!("======== Time step {}/{}: beam size = {} =========",
+                   time_idx, network_output.nrows(), beam.len());
         next_beam.clear();
 
         for (beam_idx, &search_point) in beam.iter().enumerate() {//for &search_point in &beam {
@@ -768,6 +769,8 @@ pub fn convolutional_beam_search_log<D: Data<Elem = f32>>(
                     sequence_length: sequence_length,
                     syndrome_state: syndrome_state,
                 });
+                println!("add blank: label=N, old_syn={}, score={}",
+                                       syndrome_state, log_gap_prob);
             }
 
             // ======= Determine valid base extensions based on current position =====
@@ -800,8 +803,8 @@ pub fn convolutional_beam_search_log<D: Data<Elem = f32>>(
                 for b in &mut valid_bases {
                     *b = (*b + offset) % 4;
                 }
-                //println!("  Position {}: Payload region, syndrome_state={}, offset={}, valid bases: {:?}",
-                //           sequence_length, syndrome_state, offset, valid_bases);
+                println!("  Position {}: Payload region, syndrome_state={}, offset={}, valid bases: {:?}",
+                           sequence_length-primer_length, syndrome_state, offset, valid_bases);
             }
             let log_num_valid_bases = num_valid_bases.ln();
             // ==========================================================================
@@ -810,6 +813,22 @@ pub fn convolutional_beam_search_log<D: Data<Elem = f32>>(
             for (label, &pr_b) in pr.iter().skip(1).enumerate() {
                 let log_pr_b = pr_b.ln();
                 if log_pr_b < log_beam_cut_threshold {
+                    continue;
+                }
+
+                if time_idx == 0 {
+                    if valid_bases.contains(&label) {
+                        next_beam.push(ConvSearchPointLog {
+                        node: node,
+                        log_label_prob: log_pr_b,
+                        log_gap_prob: f32::NEG_INFINITY,
+                        state: state,
+                        sequence_length: 0 as usize, // NOT SURE
+                        syndrome_state: 0 as usize,
+                        });
+                        println!("Adding first base, sequence length={}, syndrome_state={}, score={}",
+                           0, 0, log_pr_b);
+                    }
                     continue;
                 }
 
@@ -831,6 +850,8 @@ pub fn convolutional_beam_search_log<D: Data<Elem = f32>>(
                         sequence_length: sequence_length, // preserve the old sequence length & syndrome state (dwelling)
                         syndrome_state: syndrome_state,
                     });
+                    println!("label-dwells extension: position={}, label={}, old_syn={}, new_syn={}, score={}",
+                                       sequence_length-primer_length, alphabet[label+1], syndrome_state, new_syndrome_state, log_label_prob);
 
                     if valid_bases.contains(&label){
                         if sequence_length >= primer_length && sequence_length < primer_length + payload_length {
@@ -841,10 +862,6 @@ pub fn convolutional_beam_search_log<D: Data<Elem = f32>>(
                             conv_config,
                             payload_length,
                             )?;
-
-                            //println!("    Repeat-then-blank extension: label={}, old_syn={}, new_syn={}",
-                            //           label, syndrome_state, new_syndrome_state);
-
                         }
 
                         // a blank occurred before, so start a new occurrence of the same label (like a ␣ a).
@@ -866,6 +883,8 @@ pub fn convolutional_beam_search_log<D: Data<Elem = f32>>(
                                 sequence_length: new_sequence_length, // transition via blank character implies an extension
                                 syndrome_state: new_syndrome_state,
                             });
+                            println!("    Repeat-then-blank extension:  position={}, label={}, old_syn={}, new_syn={}, score={}",
+                                       sequence_length-primer_length, alphabet[label+1], syndrome_state, new_syndrome_state, log_label_prob);
                         }}
                 } else if valid_bases.contains(&label){
                     if sequence_length >= primer_length && sequence_length < primer_length + payload_length {
@@ -876,10 +895,6 @@ pub fn convolutional_beam_search_log<D: Data<Elem = f32>>(
                         conv_config,
                         payload_length,
                         )?;
-
-                        //println!("    Normal extension: label={}, old_syn={}, new_syn={}",
-                        //           label, syndrome_state, new_syndrome_state);
-
                     }
                     // Normal extension
                     let new_node_idx = suffix_tree
@@ -896,6 +911,8 @@ pub fn convolutional_beam_search_log<D: Data<Elem = f32>>(
                         sequence_length: new_sequence_length,
                         syndrome_state: new_syndrome_state,
                     });
+                    println!("    Normal extension: position={}, label={}, old_syn={}, new_syn={}, score={}",
+                                   sequence_length-primer_length, alphabet[label+1], syndrome_state, new_syndrome_state, log_label_prob);
                 }
             }
         } // dwelling/extension done
