@@ -3,11 +3,13 @@
 extern crate ndarray;
 
 use std::fmt;
-
+use std::collections::HashMap;
 mod duplex;
 mod search;
 mod tree;
 mod vec2d;
+mod code_aware_beam_search;
+mod primer_search;
 
 #[cfg(feature = "fastexp")]
 mod fastexp;
@@ -18,11 +20,13 @@ use {
     numpy::PyArray1,
     numpy::PyArray2,
     numpy::PyArray3,
+    pyo3::types::{PyDict, PySequence},
     pyo3::exceptions::{PyRuntimeError, PyValueError},
     pyo3::prelude::*,
-    pyo3::types::PySequence,
     pyo3::wrap_pyfunction,
 };
+use crate::code_aware_beam_search::ConvCodeConfig;
+
 
 #[cfg(feature = "wasm")]
 extern crate serde_derive;
@@ -87,7 +91,7 @@ pub fn js_beam_search(
         ));
         return Ok(JsValue::from_str("Error"));
     } else {
-        let (seq, starts) = search::beam_search(
+        let (seq, starts, total_comp) = search::beam_search(
             &network_output,
             &alphabet,
             beam_size,
@@ -327,7 +331,7 @@ fn beam_search(
     beam_size: usize,
     beam_cut_threshold: f32,
     collapse_repeats: bool,
-) -> PyResult<(String, Vec<usize>)> {
+) -> PyResult<(String, Vec<usize>, u64)> {
     let alphabet = seq_to_vec(alphabet)?;
     let max_beam_cut = 1.0 / (alphabet.len() as f32);
     if alphabet.len() != network_output.shape()[1] {
@@ -363,6 +367,826 @@ fn beam_search(
         .map_err(|e| PyRuntimeError::new_err(format!("{}", e)))
     }
 }
+
+#[cfg(feature = "python")]
+#[pyfunction(
+    beam_size = "5",
+    beam_cut_threshold = "0.0",
+    collapse_repeats = true
+)]
+#[pyo3(
+    text_signature = "(network_output, alphabet, beam_size=5, beam_cut_threshold=0.0, collapse_repeats=True, forward_primer, reverse_primer, offset_sequence, conv_config)"
+)]
+fn convolutional_beam_search(
+    py: Python,
+    network_output: &PyArray2<f32>,
+    alphabet: &PySequence,
+    beam_size: usize,
+    beam_cut_threshold: f32,
+    collapse_repeats: bool,
+    forward_primer_str: String,
+    reverse_primer_str: String,
+    offset_sequence_str: String,
+    conv_config: &PyDict,
+) -> PyResult<(String, Vec<usize>, u64)> {
+    // Convert alphabet
+    let alphabet = seq_to_vec(alphabet)?;
+
+    // Convert primer sequences
+    let forward_primer = dna_str_to_vec(&forward_primer_str).map_err(|e| pyo3::exceptions::PyValueError::new_err(e))?;
+    let reverse_primer = dna_str_to_vec(&reverse_primer_str).map_err(|e| pyo3::exceptions::PyValueError::new_err(e))?;
+    let offset_sequence = dna_str_to_vec(&offset_sequence_str).map_err(|e| pyo3::exceptions::PyValueError::new_err(e))?;
+
+    // Convert conv_config from PyDict to ConvCodeConfig
+    let conv_config = pydict_to_conv_config(conv_config)?;
+
+    // Validation
+    let max_beam_cut = 1.0 / (alphabet.len() as f32);
+
+    if alphabet.len() != network_output.shape()[1] {
+        return Err(PyValueError::new_err(format!(
+            "alphabet size {} does not match probability matrix inner dimension {}",
+            alphabet.len(),
+            network_output.shape()[1]
+        )));
+    }
+
+    if beam_size == 0 {
+        return Err(PyValueError::new_err("beam_size cannot be 0"));
+    }
+
+    if beam_cut_threshold < 0.0 {
+        return Err(PyValueError::new_err(
+            "beam_cut_threshold must be at least 0.0",
+        ));
+    }
+
+    if beam_cut_threshold >= max_beam_cut {
+        return Err(PyValueError::new_err(format!(
+            "beam_cut_threshold cannot be more than {}",
+            max_beam_cut
+        )));
+    }
+
+    // Validate primer values are within alphabet range
+    let max_alphabet_idx = alphabet.len() - 1;
+    for (i, &val) in forward_primer.iter().enumerate() {
+        if val > max_alphabet_idx {
+            return Err(PyValueError::new_err(format!(
+                "forward_primer[{}] = {} exceeds alphabet size {}",
+                i, val, alphabet.len()
+            )));
+        }
+    }
+
+    for (i, &val) in reverse_primer.iter().enumerate() {
+        if val > max_alphabet_idx {
+            return Err(PyValueError::new_err(format!(
+                "reverse_primer[{}] = {} exceeds alphabet size {}",
+                i, val, alphabet.len()
+            )));
+        }
+    }
+
+    for (i, &val) in offset_sequence.iter().enumerate() {
+        if val > max_alphabet_idx {
+            return Err(PyValueError::new_err(format!(
+                "offset_sequence[{}] = {} exceeds alphabet size {}",
+                i, val, alphabet.len()
+            )));
+        }
+    }
+
+    // Call the actual convolutional beam search
+    unsafe {
+        let network_output = network_output.as_array();
+        py.allow_threads(|| {
+            code_aware_beam_search::convolutional_beam_search(
+                &network_output,
+                &alphabet,
+                beam_size,
+                beam_cut_threshold,
+                collapse_repeats,
+                &forward_primer,
+                &reverse_primer,
+                &offset_sequence,
+                &conv_config,
+            )
+        })
+    }
+    .map_err(|e| PyRuntimeError::new_err(format!("{:?}", e)))
+}
+
+// fn for vanilla beam search log
+#[cfg(feature = "python")]
+#[pyfunction(
+    beam_size = "5",
+    beam_cut_threshold = "0.0",
+    collapse_repeats = true
+)]
+#[pyo3(
+    text_signature = "(network_output, alphabet, beam_size=5, payload_length, beam_cut_threshold=0.0, collapse_repeats=True, forward_primer, reverse_primer)"
+)]
+fn vanilla_beam_search_log(
+    py: Python,
+    network_output: &PyArray2<f32>,
+    alphabet: &PySequence,
+    beam_size: usize,
+    payload_length: usize,
+    beam_cut_threshold: f32,
+    collapse_repeats: bool,
+    forward_primer_str: String,
+    reverse_primer_str: String,
+) -> PyResult<(String, Vec<usize>, f32, u64)> {
+    // Convert alphabet
+    let alphabet = seq_to_vec(alphabet)?;
+
+    // Convert primer sequences
+    let forward_primer = dna_str_to_vec(&forward_primer_str).map_err(|e| pyo3::exceptions::PyValueError::new_err(e))?;
+    let reverse_primer = dna_str_to_vec(&reverse_primer_str).map_err(|e| pyo3::exceptions::PyValueError::new_err(e))?;
+
+    // Validation
+    let max_beam_cut = 1.0 / (alphabet.len() as f32);
+
+    if alphabet.len() != network_output.shape()[1] {
+        return Err(PyValueError::new_err(format!(
+            "alphabet size {} does not match probability matrix inner dimension {}",
+            alphabet.len(),
+            network_output.shape()[1]
+        )));
+    }
+
+    if beam_size == 0 {
+        return Err(PyValueError::new_err("beam_size cannot be 0"));
+    }
+
+    if beam_cut_threshold < 0.0 {
+        return Err(PyValueError::new_err(
+            "beam_cut_threshold must be at least 0.0",
+        ));
+    }
+
+    if beam_cut_threshold >= max_beam_cut {
+        return Err(PyValueError::new_err(format!(
+            "beam_cut_threshold cannot be more than {}",
+            max_beam_cut
+        )));
+    }
+
+    // Validate primer values are within alphabet range
+    let max_alphabet_idx = alphabet.len() - 1;
+    for (i, &val) in forward_primer.iter().enumerate() {
+        if val > max_alphabet_idx {
+            return Err(PyValueError::new_err(format!(
+                "forward_primer[{}] = {} exceeds alphabet size {}",
+                i, val, alphabet.len()
+            )));
+        }
+    }
+
+    for (i, &val) in reverse_primer.iter().enumerate() {
+        if val > max_alphabet_idx {
+            return Err(PyValueError::new_err(format!(
+                "reverse_primer[{}] = {} exceeds alphabet size {}",
+                i, val, alphabet.len()
+            )));
+        }
+    }
+
+    // Call the actual vanilla beam search
+    unsafe {
+        let network_output = network_output.as_array();
+        py.allow_threads(|| {
+            code_aware_beam_search::vanilla_beam_search_log(
+                &network_output,
+                &alphabet,
+                beam_size,
+                payload_length,
+                beam_cut_threshold,
+                collapse_repeats,
+                &forward_primer,
+                &reverse_primer,
+            )
+        })
+    }
+    .map_err(|e| PyRuntimeError::new_err(format!("{:?}", e)))
+}
+
+
+// fn for convolutional beam search log
+#[cfg(feature = "python")]
+#[pyfunction(
+    beam_size = "5",
+    beam_cut_threshold = "0.0",
+    collapse_repeats = true
+)]
+#[pyo3(
+    text_signature = "(network_output, alphabet, beam_size=5, beam_cut_threshold=0.0, collapse_repeats=True, forward_primer, reverse_primer, offset_sequence, conv_config)"
+)]
+fn convolutional_beam_search_log(
+    py: Python,
+    network_output: &PyArray2<f32>,
+    alphabet: &PySequence,
+    beam_size: usize,
+    beam_cut_threshold: f32,
+    collapse_repeats: bool,
+    forward_primer_str: String,
+    reverse_primer_str: String,
+    offset_sequence_str: String,
+    conv_config: &PyDict,
+) -> PyResult<(String, Vec<usize>, f32, u64)> {
+    // Convert alphabet
+    let alphabet = seq_to_vec(alphabet)?;
+
+    // Convert primer sequences
+    let forward_primer = dna_str_to_vec(&forward_primer_str).map_err(|e| pyo3::exceptions::PyValueError::new_err(e))?;
+    let reverse_primer = dna_str_to_vec(&reverse_primer_str).map_err(|e| pyo3::exceptions::PyValueError::new_err(e))?;
+    let offset_sequence = dna_str_to_vec(&offset_sequence_str).map_err(|e| pyo3::exceptions::PyValueError::new_err(e))?;
+
+    // Convert conv_config from PyDict to ConvCodeConfig
+    let conv_config = pydict_to_conv_config(conv_config)?;
+
+    // Validation
+    let max_beam_cut = 1.0 / (alphabet.len() as f32);
+
+    if alphabet.len() != network_output.shape()[1] {
+        return Err(PyValueError::new_err(format!(
+            "alphabet size {} does not match probability matrix inner dimension {}",
+            alphabet.len(),
+            network_output.shape()[1]
+        )));
+    }
+
+    if beam_size == 0 {
+        return Err(PyValueError::new_err("beam_size cannot be 0"));
+    }
+
+    if beam_cut_threshold < 0.0 {
+        return Err(PyValueError::new_err(
+            "beam_cut_threshold must be at least 0.0",
+        ));
+    }
+
+    if beam_cut_threshold >= max_beam_cut {
+        return Err(PyValueError::new_err(format!(
+            "beam_cut_threshold cannot be more than {}",
+            max_beam_cut
+        )));
+    }
+
+    // Validate primer values are within alphabet range
+    let max_alphabet_idx = alphabet.len() - 1;
+    for (i, &val) in forward_primer.iter().enumerate() {
+        if val > max_alphabet_idx {
+            return Err(PyValueError::new_err(format!(
+                "forward_primer[{}] = {} exceeds alphabet size {}",
+                i, val, alphabet.len()
+            )));
+        }
+    }
+
+    for (i, &val) in reverse_primer.iter().enumerate() {
+        if val > max_alphabet_idx {
+            return Err(PyValueError::new_err(format!(
+                "reverse_primer[{}] = {} exceeds alphabet size {}",
+                i, val, alphabet.len()
+            )));
+        }
+    }
+
+    for (i, &val) in offset_sequence.iter().enumerate() {
+        if val > max_alphabet_idx {
+            return Err(PyValueError::new_err(format!(
+                "offset_sequence[{}] = {} exceeds alphabet size {}",
+                i, val, alphabet.len()
+            )));
+        }
+    }
+
+    // Call the actual convolutional beam search
+    unsafe {
+        let network_output = network_output.as_array();
+        py.allow_threads(|| {
+            code_aware_beam_search::convolutional_beam_search_log(
+                &network_output,
+                &alphabet,
+                beam_size,
+                beam_cut_threshold,
+                collapse_repeats,
+                &forward_primer,
+                &reverse_primer,
+                &offset_sequence,
+                &conv_config,
+            )
+        })
+    }
+    .map_err(|e| PyRuntimeError::new_err(format!("{:?}", e)))
+}
+
+// fn for marker convolutional beam search log
+#[cfg(feature = "python")]
+#[pyfunction(
+    beam_size = "5",
+    beam_cut_threshold = "0.0",
+    collapse_repeats = true,
+    marker_interval = "4"
+)]
+#[pyo3(
+    text_signature = "(network_output, alphabet, beam_size=5, beam_cut_threshold=0.0, collapse_repeats=True, forward_primer, reverse_primer, offset_sequence, conv_config, marker_interval=4, marker_sequence)"
+)]
+fn marker_convolutional_beam_search_log(
+    py: Python,
+    network_output: &PyArray2<f32>,
+    alphabet: &PySequence,
+    beam_size: usize,
+    beam_cut_threshold: f32,
+    collapse_repeats: bool,
+    forward_primer_str: String,
+    reverse_primer_str: String,
+    offset_sequence_str: String,
+    conv_config: &PyDict,
+    marker_interval: usize,
+    marker_sequence_str: String,
+) -> PyResult<(String, Vec<usize>, f32, u64)> {
+    // Convert alphabet
+    let alphabet = seq_to_vec(alphabet)?;
+
+    // Convert primer sequences
+    let forward_primer = dna_str_to_vec(&forward_primer_str).map_err(|e| pyo3::exceptions::PyValueError::new_err(e))?;
+    let reverse_primer = dna_str_to_vec(&reverse_primer_str).map_err(|e| pyo3::exceptions::PyValueError::new_err(e))?;
+    let offset_sequence = dna_str_to_vec(&offset_sequence_str).map_err(|e| pyo3::exceptions::PyValueError::new_err(e))?;
+    let marker_sequence = dna_str_to_vec(&marker_sequence_str).map_err(|e| pyo3::exceptions::PyValueError::new_err(e))?;
+
+    // Convert conv_config from PyDict to ConvCodeConfig
+    let conv_config = pydict_to_conv_config(conv_config)?;
+
+    // Validation
+    let max_beam_cut = 1.0 / (alphabet.len() as f32);
+
+    if alphabet.len() != network_output.shape()[1] {
+        return Err(PyValueError::new_err(format!(
+            "alphabet size {} does not match probability matrix inner dimension {}",
+            alphabet.len(),
+            network_output.shape()[1]
+        )));
+    }
+    if beam_size == 0 {
+        return Err(PyValueError::new_err("beam_size cannot be 0"));
+    }
+    if marker_interval <= 0 {
+        return Err(PyValueError::new_err("marker interval must be positive"));
+    }
+    if beam_cut_threshold < 0.0 {
+        return Err(PyValueError::new_err(
+            "beam_cut_threshold must be at least 0.0",
+        ));
+    }
+    if beam_cut_threshold >= max_beam_cut {
+        return Err(PyValueError::new_err(format!(
+            "beam_cut_threshold cannot be more than {}",
+            max_beam_cut
+        )));
+    }
+    // Validate primer values are within alphabet range
+    let max_alphabet_idx = alphabet.len() - 1;
+    for (i, &val) in forward_primer.iter().enumerate() {
+        if val > max_alphabet_idx {
+            return Err(PyValueError::new_err(format!(
+                "forward_primer[{}] = {} exceeds alphabet size {}",
+                i, val, alphabet.len()
+            )));
+        }
+    }
+    for (i, &val) in reverse_primer.iter().enumerate() {
+        if val > max_alphabet_idx {
+            return Err(PyValueError::new_err(format!(
+                "reverse_primer[{}] = {} exceeds alphabet size {}",
+                i, val, alphabet.len()
+            )));
+        }
+    }
+    for (i, &val) in offset_sequence.iter().enumerate() {
+        if val > max_alphabet_idx {
+            return Err(PyValueError::new_err(format!(
+                "offset_sequence[{}] = {} exceeds alphabet size {}",
+                i, val, alphabet.len()
+            )));
+        }
+    }
+    for (i, &val) in marker_sequence.iter().enumerate() {
+        if val > max_alphabet_idx {
+            return Err(PyValueError::new_err(format!(
+                "marker_sequence[{}] = {} exceeds alphabet size {}",
+                i, val, alphabet.len()
+            )));
+        }
+    }
+    // Call the actual convolutional beam search
+    unsafe {
+        let network_output = network_output.as_array();
+        py.allow_threads(|| {
+            code_aware_beam_search::marker_convolutional_beam_search_log(
+                &network_output,
+                &alphabet,
+                beam_size,
+                beam_cut_threshold,
+                collapse_repeats,
+                &forward_primer,
+                &reverse_primer,
+                &offset_sequence,
+                &conv_config,
+                marker_interval,
+                &marker_sequence,
+            )
+        })
+    }
+    .map_err(|e| PyRuntimeError::new_err(format!("{:?}", e)))
+}
+
+
+// fn for primer beam search_brute
+#[cfg(feature = "python")]
+#[pyfunction(
+    beam_size = "5",
+    beam_cut_threshold = "0.0"
+)]
+#[pyo3(
+    text_signature = "(network_output, beam_size=5, beam_cut_threshold=0.0, primer_sequence, max_sample_depth, shift)"
+)]
+fn primer_beam_search_brute(
+    py: Python,
+    network_output: &PyArray2<f32>,
+    beam_size: usize,
+    beam_cut_threshold: f32,
+    primer_str: String,
+    max_sample_depth: usize,
+    shift: usize,
+    subsample: usize,
+) -> PyResult<(Vec<f32>, u64)> {
+    // Convert primer sequence
+    let primer_sequence = dna_str_to_vec(&primer_str).map_err(|e| pyo3::exceptions::PyValueError::new_err(e))?;
+
+    // Validation
+    if network_output.shape()[1] != 5{
+        return Err(PyValueError::new_err(format!(
+            "Probability matrix must have inner dimension 5, instead has {}",
+            network_output.shape()[1]
+        )));
+    }
+
+    if beam_size == 0 {
+        return Err(PyValueError::new_err("beam_size cannot be 0"));
+    }
+
+    if subsample <= 0 {
+        return Err(PyValueError::new_err("subsample must be greater than or equal to 1"));
+    }
+
+    if beam_cut_threshold < 0.0 {
+        return Err(PyValueError::new_err(
+            "beam_cut_threshold must be at least 0.0",
+        ));
+    }
+
+    // Validate primer values are within alphabet range
+    let max_alphabet_idx = 3;
+    for (i, &val) in primer_sequence.iter().enumerate() {
+        if val > max_alphabet_idx {
+            return Err(PyValueError::new_err(format!(
+                "primer_sequence[{}] = {} exceeds alphabet size 3",
+                i, val
+            )));
+        }
+    }
+    // Call the actual convolutional beam search
+    unsafe {
+        let network_output = network_output.as_array();
+        py.allow_threads(|| {
+            primer_search::primer_beam_search_brute(
+                &network_output,
+                beam_size,
+                beam_cut_threshold,
+                &primer_sequence,
+                max_sample_depth,
+                shift,
+                subsample
+            )
+        })
+    }
+    .map_err(|e| PyRuntimeError::new_err(format!("{:?}", e)))
+}
+
+
+// fn for primer beam search (with tricks)
+#[cfg(feature = "python")]
+#[pyfunction(
+    beam_size = "5",
+    beam_cut_threshold = "0.0"
+)]
+#[pyo3(
+    text_signature = "(network_output, beam_size=5, beam_cut_threshold=0.0, primer_sequence, max_sample_depth, shift)"
+)]
+fn primer_beam_search_opt(
+    py: Python,
+    network_output: &PyArray2<f32>,
+    beam_size: usize,
+    fraction_to_examine: f32,
+    beam_cut_threshold: f32,
+    concentration_threshold: f32,
+    primer_str: String,
+    max_sample_depth: usize,
+    shift: usize,
+    subsample: usize,
+) -> PyResult<(Vec<f32>, u64)> {
+    // Convert primer sequence
+    let primer_sequence = dna_str_to_vec(&primer_str).map_err(|e| pyo3::exceptions::PyValueError::new_err(e))?;
+
+    // Validation
+    if network_output.shape()[1] != 5{
+        return Err(PyValueError::new_err(format!(
+            "Probability matrix must have inner dimension 5, instead has {}",
+            network_output.shape()[1]
+        )));
+    }
+
+    if beam_size == 0 {
+        return Err(PyValueError::new_err("beam_size cannot be 0"));
+    }
+    if fraction_to_examine < 0.0 || fraction_to_examine > 1.0 {
+        return Err(PyValueError::new_err("fraction_to_examine must be between 0.0 and 1.0"));
+    }
+    if subsample <= 0 {
+        return Err(PyValueError::new_err("subsample must be greater than or equal to 1"));
+    }
+
+    if beam_cut_threshold < 0.0 {
+        return Err(PyValueError::new_err(
+            "beam_cut_threshold must be at least 0.0",
+        ));
+    }
+    if concentration_threshold < 0.0 {
+        return Err(PyValueError::new_err(
+            "concentration_threshold must be at least 0.0",
+        ));
+    }
+
+    // Validate primer values are within alphabet range
+    let max_alphabet_idx = 3;
+    for (i, &val) in primer_sequence.iter().enumerate() {
+        if val > max_alphabet_idx {
+            return Err(PyValueError::new_err(format!(
+                "primer_sequence[{}] = {} exceeds alphabet size 3",
+                i, val
+            )));
+        }
+    }
+    // Call the actual convolutional beam search
+    unsafe {
+        let network_output = network_output.as_array();
+        py.allow_threads(|| {
+            primer_search::primer_beam_search_opt(
+                &network_output,
+                beam_size,
+                fraction_to_examine,
+                beam_cut_threshold,
+                concentration_threshold,
+                &primer_sequence,
+                max_sample_depth,
+                shift,
+                subsample
+            )
+        })
+    }
+    .map_err(|e| PyRuntimeError::new_err(format!("{:?}", e)))
+}
+
+// fn for primer beam search (smart subsampler)
+#[cfg(feature = "python")]
+#[pyfunction(
+    beam_size = "5",
+    beam_cut_threshold = "0.0"
+)]
+#[pyo3(
+    text_signature = "(network_output, beam_size=5, beam_cut_threshold=0.0, primer_sequence, max_sample_depth, shift)"
+)]
+fn primer_beam_search_ss(
+    py: Python,
+    network_output: &PyArray2<f32>,
+    beam_size: usize,
+    min_beam_size: usize,
+    beam_cut_threshold: f32,
+    concentration_threshold: f32,
+    relative_prob_threshold: f32,
+    primer_str: String,
+    max_sample_depth: usize,
+    truncation_int1: usize,
+    truncation_int2: usize,
+    shift: usize,
+    subsample: usize,
+) -> PyResult<(Vec<f32>, u64)> {
+    // Convert primer sequence
+    let primer_sequence = dna_str_to_vec(&primer_str).map_err(|e| pyo3::exceptions::PyValueError::new_err(e))?;
+
+    // Validation
+    if network_output.shape()[1] != 5{
+        return Err(PyValueError::new_err(format!(
+            "Probability matrix must have inner dimension 5, instead has {}",
+            network_output.shape()[1]
+        )));
+    }
+
+    if beam_size == 0 {
+        return Err(PyValueError::new_err("beam_size cannot be 0"));
+    }
+    if min_beam_size == 0 {
+        return Err(PyValueError::new_err("min_beam_size cannot be 0"));
+    }
+    if min_beam_size > beam_size {
+        return Err(PyValueError::new_err("min_beam_size should be less than or equal to beam_size"));
+    }
+    if subsample <= 0 {
+        return Err(PyValueError::new_err("subsample must be greater than or equal to 1"));
+    }
+
+    if beam_cut_threshold < 0.0 {
+        return Err(PyValueError::new_err(
+            "beam_cut_threshold must be at least 0.0",
+        ));
+    }
+    if concentration_threshold < 0.0 {
+        return Err(PyValueError::new_err(
+            "concentration_threshold must be at least 0.0",
+        ));
+    }
+    if relative_prob_threshold < 0.0 {
+        return Err(PyValueError::new_err(
+            "relative_prob_threshold must be at least 0.0",
+        ));
+    }
+
+    // Validate primer values are within alphabet range
+    let max_alphabet_idx = 3;
+    for (i, &val) in primer_sequence.iter().enumerate() {
+        if val > max_alphabet_idx {
+            return Err(PyValueError::new_err(format!(
+                "primer_sequence[{}] = {} exceeds alphabet size 3",
+                i, val
+            )));
+        }
+    }
+    // Call the actual convolutional beam search
+    unsafe {
+        let network_output = network_output.as_array();
+        py.allow_threads(|| {
+            primer_search::primer_beam_search_ss(
+                &network_output,
+                beam_size,
+                min_beam_size,
+                beam_cut_threshold,
+                concentration_threshold,
+                relative_prob_threshold,
+                &primer_sequence,
+                max_sample_depth,
+                truncation_int1,
+                truncation_int2,
+                shift,
+                subsample
+            )
+        })
+    }
+    .map_err(|e| PyRuntimeError::new_err(format!("{:?}", e)))
+}
+
+
+#[cfg(feature = "python")]
+// Helper function to convert PySequence to Vec<usize>
+fn seq_to_usize_vec(seq: &PySequence) -> PyResult<Vec<usize>> {
+    let mut result = Vec::new();
+    for item in seq.iter()? {
+        let item = item?;
+        let usize_item: usize = item.extract()?;
+        result.push(usize_item);
+    }
+    Ok(result)
+}
+
+fn dna_str_to_vec(seq: &str) -> Result<Vec<usize>, String> {
+    let mut vec = Vec::with_capacity(seq.len());
+
+    for c in seq.chars() {
+        let val = match c {
+            'A' | 'a' => 0,
+            'C' | 'c' => 1,
+            'G' | 'g' => 2,
+            'T' | 't' => 3,
+            _ => return Err(format!("Invalid character: {}", c)),
+        };
+        vec.push(val);
+    }
+
+    Ok(vec)
+}
+
+
+#[cfg(feature = "python")]
+// Helper function to convert PyDict to ConvCodeConfig
+fn pydict_to_conv_config(dict: &PyDict) -> PyResult<ConvCodeConfig> {
+    let k: usize = dict.get_item("K")
+        .ok_or_else(|| PyValueError::new_err("Missing 'K' in conv_config"))?
+        .extract()?;
+
+    let b: usize = dict.get_item("b")
+        .ok_or_else(|| PyValueError::new_err("Missing 'b' in conv_config"))?
+        .extract()?;
+
+    let c: usize = dict.get_item("c")
+        .ok_or_else(|| PyValueError::new_err("Missing 'c' in conv_config"))?
+        .extract()?;
+
+    let df: usize = dict.get_item("df")
+        .ok_or_else(|| PyValueError::new_err("Missing 'df' in conv_config"))?
+        .extract()?;
+
+    let ext: usize = dict.get_item("ext")
+        .ok_or_else(|| PyValueError::new_err("Missing 'ext' in conv_config"))?
+        .extract()?;
+
+    let m: usize = dict.get_item("m")
+        .ok_or_else(|| PyValueError::new_err("Missing 'm' in conv_config"))?
+        .extract()?;
+
+    let q: usize = dict.get_item("q")
+        .ok_or_else(|| PyValueError::new_err("Missing 'q' in conv_config"))?
+        .extract()?;
+
+    let num_term_code_symbols: usize = dict.get_item("num_term_code_symbols")
+        .ok_or_else(|| PyValueError::new_err("Missing 'num_term_code_symbols' in conv_config"))?
+        .extract()?;
+
+    // Convert num_edges
+    let num_edges_py: &PySequence = dict.get_item("numEdges")
+        .ok_or_else(|| PyValueError::new_err("Missing 'numEdges' in conv_config"))?
+        .downcast()?;
+    let num_edges = seq_to_usize_vec(num_edges_py)?;
+
+    // Convert allowed_edges - this is more complex
+    let allowed_edges_py: &PySequence = dict.get_item("allowedEdges")
+        .ok_or_else(|| PyValueError::new_err("Missing 'allowedEdges' in conv_config"))?
+        .downcast()?;
+    let allowed_edges = convert_allowed_edges(allowed_edges_py)?;
+
+    // Convert allowed_edges_term
+    let allowed_edges_term_py: &PySequence = dict.get_item("allowedEdges_term")
+        .ok_or_else(|| PyValueError::new_err("Missing 'allowedEdges_term' in conv_config"))?
+        .downcast()?;
+    let allowed_edges_term = convert_allowed_edges(allowed_edges_term_py)?;
+
+    Ok(ConvCodeConfig {
+        k,
+        allowed_edges,
+        allowed_edges_term,
+        b,
+        c,
+        df,
+        ext,
+        m,
+        num_edges,
+        num_term_code_symbols,
+        q,
+    })
+}
+#[cfg(feature = "python")]
+// Helper function to convert Python allowed_edges structure
+fn convert_allowed_edges(seq: &PySequence) -> PyResult<Vec<HashMap<String, Vec<Vec<usize>>>>> {
+    let mut result = Vec::new();
+
+    for item in seq.iter()? {
+        let item = item?;
+        let dict: &PyDict = item.downcast()?;
+        let mut edge_map = HashMap::new();
+
+        for (key, value) in dict {
+            let key_str: String = key.extract()?;
+            let value_seq: &PySequence = value.downcast()?;
+
+            let mut edge_list = Vec::new();
+            for edge_item in value_seq.iter()? {
+                let edge_item = edge_item?;
+                let edge_seq: &PySequence = edge_item.downcast()?;
+                let edge_vec = seq_to_usize_vec(edge_seq)?;
+                edge_list.push(edge_vec);
+            }
+
+            edge_map.insert(key_str, edge_list);
+        }
+
+        result.push(edge_map);
+    }
+
+    Ok(result)
+}
+
+
 
 /// Perform a CTC beam search decode on two RNN outputs that describe the same sequence.
 ///
@@ -614,9 +1438,17 @@ fn crf_beam_search_duplex(
 /// network output(s) - therefore, len(alphabet) must be the size of that inner axis. Using a list
 /// or tuple allows multi-character labels to be specified. Note that the first label is not
 /// actually used by any of the functions in this module, so the value does not matter.
+
 #[cfg(feature = "python")]
 #[pymodule]
 fn fast_ctc_decode(_py: Python, m: &PyModule) -> PyResult<()> {
+    m.add_wrapped(wrap_pyfunction!(convolutional_beam_search))?;
+    m.add_wrapped(wrap_pyfunction!(vanilla_beam_search_log))?;
+    m.add_wrapped(wrap_pyfunction!(convolutional_beam_search_log))?;
+    m.add_wrapped(wrap_pyfunction!(marker_convolutional_beam_search_log))?;
+    m.add_wrapped(wrap_pyfunction!(primer_beam_search_brute))?;
+    m.add_wrapped(wrap_pyfunction!(primer_beam_search_opt))?;
+    m.add_wrapped(wrap_pyfunction!(primer_beam_search_ss))?;
     m.add_wrapped(wrap_pyfunction!(beam_search))?;
     m.add_wrapped(wrap_pyfunction!(beam_search_duplex))?;
     m.add_wrapped(wrap_pyfunction!(viterbi_search))?;

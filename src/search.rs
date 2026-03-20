@@ -162,20 +162,24 @@ pub fn beam_search<D: Data<Elem = f32>>(
     beam_size: usize,
     beam_cut_threshold: f32,
     collapse_repeats: bool,
-) -> Result<(String, Vec<usize>), SearchError> {
+) -> Result<(String, Vec<usize>, u64), SearchError> {
     // alphabet size minus the blank label
     let alphabet_size = alphabet.len() - 1;
 
-    let mut suffix_tree = SuffixTree::new(alphabet_size);
+
+    // INITIALIZATION
+    let mut suffix_tree = SuffixTree::new(alphabet_size); // tracks partial sequences
     let mut beam = vec![SearchPoint {
         node: ROOT_NODE,
         state: 0,
-        gap_prob: 1.0,
-        label_prob: 0.0,
+        gap_prob: 1.0, // initial probability for blank/gap
+        label_prob: 0.0, // initial probability for label
     }];
     let mut next_beam = Vec::new();
+    let mut total_score_computations: u64 = 0;
 
     for (idx, pr) in network_output.outer_iter().enumerate() {
+    // For each time step and its probability distribution
         next_beam.clear();
 
         for &SearchPoint {
@@ -187,8 +191,10 @@ pub fn beam_search<D: Data<Elem = f32>>(
         {
             let tip_label = suffix_tree.label(node);
 
+            // Add blank/gap transition
             // add N to beam
             if pr[0] > beam_cut_threshold {
+                total_score_computations += 1;
                 next_beam.push(SearchPoint {
                     node: node,
                     state: state,
@@ -197,18 +203,23 @@ pub fn beam_search<D: Data<Elem = f32>>(
                 });
             }
 
+            // Add label transitions
             for (label, &pr_b) in pr.iter().skip(1).enumerate() {
                 if pr_b < beam_cut_threshold {
                     continue;
                 }
 
+                // Same label as current tip - handle repeat collapse
                 if collapse_repeats && Some(label) == tip_label {
+                    total_score_computations += 1;
                     next_beam.push(SearchPoint {
                         node: node,
                         label_prob: label_prob * pr_b,
                         gap_prob: 0.0,
                         state: state,
                     });
+
+                    // Also allow transition through blank to new occurrence
                     let new_node_idx = suffix_tree.get_child(node, label).or_else(|| {
                         if gap_prob > 0.0 {
                             Some(suffix_tree.add_node(node, label, idx))
@@ -218,6 +229,7 @@ pub fn beam_search<D: Data<Elem = f32>>(
                     });
 
                     if let Some(idx) = new_node_idx {
+                        total_score_computations += 1;
                         next_beam.push(SearchPoint {
                             node: idx,
                             state: state,
@@ -229,7 +241,7 @@ pub fn beam_search<D: Data<Elem = f32>>(
                     let new_node_idx = suffix_tree
                         .get_child(node, label)
                         .unwrap_or_else(|| suffix_tree.add_node(node, label, idx));
-
+                    total_score_computations += 1;
                     next_beam.push(SearchPoint {
                         node: new_node_idx,
                         state: state,
@@ -240,17 +252,26 @@ pub fn beam_search<D: Data<Elem = f32>>(
             }
         }
         std::mem::swap(&mut beam, &mut next_beam);
+        // - Implements CTC repeat collapse rule
+        // - When same label repeats, can either:
+        //    - Stay at current position (dwelling)
+        //    - Move to new occurrence if there was a gap/blank before
+        // - Distinguishes between label probability and gap probability paths
+
 
         const DELETE_MARKER: i32 = i32::min_value();
+
+        // Step 4a: Merge identical paths
         beam.sort_by_key(|x| x.node);
         let mut last_key = DELETE_MARKER;
         let mut last_key_pos = 0;
         for i in 0..beam.len() {
             let beam_item = beam[i];
             if beam_item.node == last_key {
+                // Merge probabilities for same node
                 beam[last_key_pos].label_prob += beam_item.label_prob;
                 beam[last_key_pos].gap_prob += beam_item.gap_prob;
-                beam[i].node = DELETE_MARKER;
+                beam[i].node = DELETE_MARKER; // Mark for deletion
             } else {
                 last_key_pos = i;
                 last_key = beam_item.node;
@@ -259,6 +280,8 @@ pub fn beam_search<D: Data<Elem = f32>>(
 
         beam.retain(|x| x.node != DELETE_MARKER);
         let mut has_nans = false;
+
+        // Step 4b: Sort by total probability and prune
         beam.sort_unstable_by(|a, b| {
             (b.probability())
                 .partial_cmp(&(a.probability()))
@@ -275,11 +298,13 @@ pub fn beam_search<D: Data<Elem = f32>>(
             // we've run out of beam (probably the threshold is too high)
             return Err(SearchError::RanOutOfBeam);
         }
-        let top = beam[0].probability();
+
+        // Step 4c: Normalize probabilities
+        /*let top = beam[0].probability();
         for x in &mut beam {
             x.label_prob /= top;
             x.gap_prob /= top;
-        }
+        }*/
     }
 
     let mut path = Vec::new();
@@ -293,7 +318,23 @@ pub fn beam_search<D: Data<Elem = f32>>(
     }
 
     path.reverse();
-    Ok((sequence.chars().rev().collect::<String>(), path))
+    Ok((sequence.chars().rev().collect::<String>(), path, total_score_computations))
+
+    /*
+    Algorithm Flow Summary
+
+        1. Initialize with single root beam point
+        2. For each time step:
+                Extend each beam point with all possible transitions (blank + labels)
+                Handle dwelling for repeat labels using CTC rules
+                Merge paths that lead to identical sequences
+                Prune to keep only top candidates
+                Normalize probabilities for numerical stability
+        3. Return best path by tracing back through suffix tree
+
+        The suffix tree efficiently tracks partial sequences and enables fast merging of equivalent paths, while the beam search maintains only the most promising candidates at each step.
+    */
+
 }
 
 fn find_max(
@@ -589,10 +630,10 @@ mod tests {
         assert_eq!(seq, "GGGGGAG%&##$$(");
         assert_eq!(starts, vec![2, 3, 4, 7, 8, 9, 11]);
 
-        let (seq, _starts) = beam_search(&network_output, &alphabet, 5, 0.0, true).unwrap();
+        let (seq, _starts, total_score_computations) = beam_search(&network_output, &alphabet, 5, 0.0, true).unwrap();
         assert_eq!(seq, "GAGAG");
 
-        let (seq, _starts) = beam_search(&network_output, &alphabet, 5, 0.0, false).unwrap();
+        let (seq, _starts, total_score_computations) = beam_search(&network_output, &alphabet, 5, 0.0, false).unwrap();
         assert_eq!(seq, "GGGAGAG");
     }
 
