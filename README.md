@@ -54,9 +54,8 @@ cd ..
 5
 
 >>> with open("convolutional_codes_trellises/cc_2_1_3.json") as f:
-        conv_config = json.load(f)
+>>>    conv_config = json.load(f)
 >>> prob_matrix=np.matrix([ [0.0, 1.0, 0.0, 0.0, 0.0],  # A - 0
-                            [0.0, 1.0, 0.0, 0.0, 0.0],  # A - 0
                             [0.0, 0.0, 0.0, 0.0, 1.0],  # T - 1
                             [0.0, 0.0, 0.0, 0.0, 1.0],  # T - 2  AT (2)
                             [0.0, 1.0, 0.0, 0.0, 0.0],  # A - 3  ATA (3)
@@ -71,9 +70,10 @@ cd ..
                             [0.0, 0.0, 1.0, 0.0, 0.0],  # C
                             [0.0, 0.0, 0.0, 1.0, 0.0],  # G
                         ], dtype='float32')
+
 >>> forward_primer_str = "AT"
 >>> reverse_primer_str = "CG"
->>> offset_sequence_str = "ACACG"
+>>> offset_sequence_str = "CTAAA"
 >>> seq, starts, score, total_computations = convolutional_beam_search_log(
                                                     prob_matrix,
                                                     alphabet,
@@ -85,7 +85,6 @@ cd ..
                                                     offset_sequence_str=offset_sequence_str,
                                                     conv_config=conv_config,
                                                 )
->>> assert(seq[:2] == "AT");
->>> seq
+>>> seq # works since [3,1,1,1,3] or 'TCCCT' is a codeword of the [2,1,3] conv code. Payload 'AACCT' is codeword+offset (mod 4)
 'ATAACCTCG'
 ```
