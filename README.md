@@ -7,7 +7,7 @@
 - The `my-extension` branch of this repository includes the CTC-based implementations of our novel algorithms PrimerSeeker and Synde.
     - PrimerSeeker: a dedicated algorithm that locates the start of a primer in the raw read
     - Synde: a solution for basecaller-decoder integration that performs convolutional decoding by performing a constrained beam search -  one that exploits the syndrome trellis representation of the concerned convolutional code. Its main advantage is that its complexity is independent of the memory of the convolutional code.
-
+- Thanks to [Roman Sokolovskii](https://github.com/rsokolovskii) for contributing to this project!!
 
 ## Download and installation
 

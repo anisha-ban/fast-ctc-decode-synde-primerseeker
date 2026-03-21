@@ -144,7 +144,7 @@ pub fn convolutional_beam_search<D: Data<Elem = f32>>(
     let mut best_complete: Option<ConvSearchPoint> = None;
     // Counter for tracking complexity (number of score computations)
     let mut total_score_computations: u64 = 0;
-    
+
     for (time_idx, pr) in network_output.outer_iter().enumerate() {
     // For each time step and its probability distribution
 
@@ -1066,15 +1066,20 @@ pub fn marker_convolutional_beam_search_log<D: Data<Elem = f32>>(
     let log_beam_cut_threshold = beam_cut_threshold.ln();
 
     let mut suffix_tree = SuffixTree::new(alphabet_size); // tracks partial sequences
+    let first_base = forward_primer[0];
+    let init_prob = network_output[[0, first_base + 1]];
+    let first_node_idx = suffix_tree
+                        .get_child(ROOT_NODE, first_base)
+                        .unwrap_or_else(|| suffix_tree.add_node(ROOT_NODE, first_base, 0));
+
     let mut beam = vec![ConvSearchPointLog {
-        node: ROOT_NODE,
+        node: first_node_idx,
         state: 0,
-        log_gap_prob: 0.0,  // ln(1.0) = 0.0
-        log_label_prob: f32::NEG_INFINITY,  // ln(0.0) = -inf
-        sequence_length: 0,
+        log_gap_prob: f32::NEG_INFINITY,  // ln(1.0) = 0.0
+        log_label_prob: init_prob.ln(),  // ln(0.0) = -inf
+        sequence_length: 1 as usize,
         syndrome_state: 0,  // Start in syndrome state 0
     }];
-
     let mut next_beam = Vec::new();
 
     // to track best beam of target length
@@ -1082,7 +1087,9 @@ pub fn marker_convolutional_beam_search_log<D: Data<Elem = f32>>(
 
     for (time_idx, pr) in network_output.outer_iter().enumerate() {
     // For each time step and its probability distribution
-
+        if time_idx == 0 {
+            continue;
+        }
         next_beam.clear();
 
         for (beam_idx, &search_point) in beam.iter().enumerate() {
