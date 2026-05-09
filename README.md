@@ -26,7 +26,7 @@ cd ..
 
 ```python
 >>> from fast_ctc_decode import primer_beam_search_opt as primer_beam_search
->>> from fast_ctc_decode import convolutional_beam_search_log
+>>> from fast_ctc_decode import convolutional_beam_search_log, marker_beam_search_log_track
 >>> import numpy as np
 >>> import json
 >>> alphabet = "NACGT"
@@ -87,4 +87,38 @@ cd ..
                                                 )
 >>> seq # works since [3,1,1,1,3] or 'TCCCT' is a codeword of the [2,1,3] conv code. Payload 'AACCT' is codeword+offset (mod 4)
 'ATAACCTCG'
+
+>>> prob_matrix=np.matrix([ [0.0, 1.0, 0.0, 0.0, 0.0],  # A - 0
+                            [0.0, 0.0, 0.0, 0.0, 1.0],  # T - 1
+                            [0.0, 0.0, 0.0, 0.0, 1.0],  # T - 2  AT (2)
+                            [0.0, 1.0, 0.0, 0.0, 0.0],  # A - 3  ATA (3)
+                            [1.0, 0.0, 0.0, 0.0, 0.0],  # N - 4  ATA (3)
+                            [0.0, 0.0, 1.0, 0.0, 0.0],  # C - 5  ATAC (4)
+                            [0.0, 0.0, 1.0, 0.0, 0.0],  # C - 6  ATAC (5)
+                            [0.0, 0.0, 1.0, 0.0, 0.0],  # C - 7  ATAC (5)
+                            [1.0, 0.0, 0.0, 0.0, 0.0],  # N - 8  ATAC (5)
+                            [0.0, 0.0, 1.0, 0.0, 0.0],  # C - 9  ATACC (6)
+                            [0.0, 0.0, 1.0, 0.0, 0.0],  # C - 10 ATACC (6)
+                            [0.0, 0.0, 0.0, 0.0, 1.0],  # T - 11 ATACCT
+                            [0.0, 1.0, 0.0, 0.0, 0.0],  # A - 12 ATACCTA
+                            [0.0, 0.0, 1.0, 0.0, 0.0],  # C
+                            [0.0, 0.0, 0.0, 1.0, 0.0],  # G
+                        ], dtype='float32')
+>>> forward_primer_str = "AT"
+>>> reverse_primer_str = "CG"
+>>> offset_sequence_str = "AAAAA"
+>>> marker_interval = 2
+>>> marker_sequence_str = "C"
+>>> seq, score, base_probabilities = marker_beam_search_log_track(
+                                                    prob_matrix,
+                                                    alphabet,
+                                                    beam_size=5,
+                                                    beam_cut_threshold=0.0,
+                                                    collapse_repeats=True,
+                                                    forward_primer_str=forward_primer_str,
+                                                    reverse_primer_str=reverse_primer_str,
+                                                    offset_sequence_str=offset_sequence_str,
+                                                    marker_interval=marker_interval,
+                                                    marker_sequence_str=marker_sequence_str,
+                                                ) # seq should be 'ATACCTACG'
 ```

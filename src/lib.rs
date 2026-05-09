@@ -803,6 +803,121 @@ fn marker_convolutional_beam_search_log(
     .map_err(|e| PyRuntimeError::new_err(format!("{:?}", e)))
 }
 
+// fn for marker beam search log track
+#[cfg(feature = "python")]
+#[pyfunction(
+    beam_size = "5",
+    beam_cut_threshold = "0.0",
+    collapse_repeats = true,
+    marker_interval = "4"
+)]
+#[pyo3(
+    text_signature = "(network_output, alphabet, beam_size=5, beam_cut_threshold=0.0, collapse_repeats=True, forward_primer, reverse_primer, offset_sequence, marker_interval=4, marker_sequence)"
+)]
+fn marker_beam_search_log_track(
+    py: Python,
+    network_output: &PyArray2<f32>,
+    alphabet: &PySequence,
+    beam_size: usize,
+    beam_cut_threshold: f32,
+    collapse_repeats: bool,
+    forward_primer_str: String,
+    reverse_primer_str: String,
+    offset_sequence_str: String,
+    marker_interval: usize,
+    marker_sequence_str: String,
+) -> PyResult<(String, f32, Vec<[f32; 4]>)> {
+    // Convert alphabet
+    let alphabet = seq_to_vec(alphabet)?;
+
+    // Convert primer sequences
+    let forward_primer = dna_str_to_vec(&forward_primer_str).map_err(|e| pyo3::exceptions::PyValueError::new_err(e))?;
+    let reverse_primer = dna_str_to_vec(&reverse_primer_str).map_err(|e| pyo3::exceptions::PyValueError::new_err(e))?;
+    let offset_sequence = dna_str_to_vec(&offset_sequence_str).map_err(|e| pyo3::exceptions::PyValueError::new_err(e))?;
+    let marker_sequence = dna_str_to_vec(&marker_sequence_str).map_err(|e| pyo3::exceptions::PyValueError::new_err(e))?;
+
+    // Validation
+    let max_beam_cut = 1.0 / (alphabet.len() as f32);
+
+    if alphabet.len() != network_output.shape()[1] {
+        return Err(PyValueError::new_err(format!(
+            "alphabet size {} does not match probability matrix inner dimension {}",
+            alphabet.len(),
+            network_output.shape()[1]
+        )));
+    }
+    if beam_size == 0 {
+        return Err(PyValueError::new_err("beam_size cannot be 0"));
+    }
+    if marker_interval <= 0 {
+        return Err(PyValueError::new_err("marker interval must be positive"));
+    }
+    if beam_cut_threshold < 0.0 {
+        return Err(PyValueError::new_err(
+            "beam_cut_threshold must be at least 0.0",
+        ));
+    }
+    if beam_cut_threshold >= max_beam_cut {
+        return Err(PyValueError::new_err(format!(
+            "beam_cut_threshold cannot be more than {}",
+            max_beam_cut
+        )));
+    }
+    // Validate primer values are within alphabet range
+    let max_alphabet_idx = alphabet.len() - 1;
+    for (i, &val) in forward_primer.iter().enumerate() {
+        if val > max_alphabet_idx {
+            return Err(PyValueError::new_err(format!(
+                "forward_primer[{}] = {} exceeds alphabet size {}",
+                i, val, alphabet.len()
+            )));
+        }
+    }
+    for (i, &val) in reverse_primer.iter().enumerate() {
+        if val > max_alphabet_idx {
+            return Err(PyValueError::new_err(format!(
+                "reverse_primer[{}] = {} exceeds alphabet size {}",
+                i, val, alphabet.len()
+            )));
+        }
+    }
+    for (i, &val) in offset_sequence.iter().enumerate() {
+        if val > max_alphabet_idx {
+            return Err(PyValueError::new_err(format!(
+                "offset_sequence[{}] = {} exceeds alphabet size {}",
+                i, val, alphabet.len()
+            )));
+        }
+    }
+    for (i, &val) in marker_sequence.iter().enumerate() {
+        if val > max_alphabet_idx {
+            return Err(PyValueError::new_err(format!(
+                "marker_sequence[{}] = {} exceeds alphabet size {}",
+                i, val, alphabet.len()
+            )));
+        }
+    }
+    // Call the method
+    unsafe {
+        let network_output = network_output.as_array();
+        py.allow_threads(|| {
+            code_aware_beam_search::marker_beam_search_log_track(
+                &network_output,
+                &alphabet,
+                beam_size,
+                beam_cut_threshold,
+                collapse_repeats,
+                &forward_primer,
+                &reverse_primer,
+                &offset_sequence,
+                marker_interval,
+                &marker_sequence,
+            )
+        })
+    }
+        .map_err(|e| PyRuntimeError::new_err(format!("{:?}", e)))
+}
+
 
 // fn for primer beam search_brute
 #[cfg(feature = "python")]
@@ -1446,6 +1561,7 @@ fn fast_ctc_decode(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_wrapped(wrap_pyfunction!(vanilla_beam_search_log))?;
     m.add_wrapped(wrap_pyfunction!(convolutional_beam_search_log))?;
     m.add_wrapped(wrap_pyfunction!(marker_convolutional_beam_search_log))?;
+    m.add_wrapped(wrap_pyfunction!(marker_beam_search_log_track))?;
     m.add_wrapped(wrap_pyfunction!(primer_beam_search_brute))?;
     m.add_wrapped(wrap_pyfunction!(primer_beam_search_opt))?;
     m.add_wrapped(wrap_pyfunction!(primer_beam_search_ss))?;
