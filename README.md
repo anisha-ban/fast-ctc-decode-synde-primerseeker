@@ -121,6 +121,9 @@ cd ..
                                                     marker_interval=marker_interval,
                                                     marker_sequence_str=marker_sequence_str,
                                                 ) # seq should be 'ATACCTACG'
+>>> forward_primer_str = "ATA"
+>>> reverse_primer_str = "CG"
+>>> offset_sequence_str = "AAAA" # testing if different primer lengths work
 >>> seq, score, base_probabilities = beam_search_log_with_base_probabilities(
                                                     prob_matrix,
                                                     alphabet,

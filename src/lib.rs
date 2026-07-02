@@ -1779,6 +1779,7 @@ fn fast_ctc_decode(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_wrapped(wrap_pyfunction!(marker_convolutional_beam_search_log))?;
     m.add_wrapped(wrap_pyfunction!(marker_beam_search_log))?;
     m.add_wrapped(wrap_pyfunction!(marker_beam_search_log_track))?;
+    m.add_wrapped(wrap_pyfunction!(beam_search_log_with_base_probabilities))?;
     m.add_wrapped(wrap_pyfunction!(primer_beam_search_brute))?;
     m.add_wrapped(wrap_pyfunction!(primer_beam_search_opt))?;
     m.add_wrapped(wrap_pyfunction!(primer_beam_search_ss))?;
