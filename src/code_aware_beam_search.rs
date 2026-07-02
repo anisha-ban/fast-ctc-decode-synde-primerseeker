@@ -1426,13 +1426,18 @@ pub fn marker_beam_search_log<D: Data<Elem = f32>>(
     let log_beam_cut_threshold = beam_cut_threshold.ln();
 
     let mut suffix_tree = SuffixTree::new(alphabet_size); // tracks partial sequences
+    let first_base = forward_primer[0];
+    let init_prob = network_output[[0, first_base + 1]];
+    let first_node_idx = suffix_tree
+        .get_child(ROOT_NODE, first_base)
+        .unwrap_or_else(|| suffix_tree.add_node(ROOT_NODE, first_base, 0));
     let mut beam = vec![ConvSearchPointLog {
-        node: ROOT_NODE,
+        node: first_node_idx,
         state: 0,
-        log_gap_prob: 0.0,  // ln(1.0) = 0.0
-        log_label_prob: f32::NEG_INFINITY,  // ln(0.0) = -inf
-        sequence_length: 0,
-        syndrome_state: 0,  // Syndrome state unused
+        log_gap_prob: f32::NEG_INFINITY,  // ln(1.0) = 0.0
+        log_label_prob: init_prob.ln(),  // ln(0.0) = -inf
+        sequence_length: 1 as usize,
+        syndrome_state: 0,  // Start in syndrome state 0
     }];
 
     let mut next_beam = Vec::new();
@@ -1442,7 +1447,9 @@ pub fn marker_beam_search_log<D: Data<Elem = f32>>(
 
     for (time_idx, pr) in network_output.outer_iter().enumerate() {
     // For each time step and its probability distribution
-
+        if time_idx == 0 {
+            continue;
+        }
         next_beam.clear();
 
         for (beam_idx, &search_point) in beam.iter().enumerate() {
@@ -1551,13 +1558,8 @@ pub fn marker_beam_search_log<D: Data<Elem = f32>>(
 
                             let cw_idx_ = sequence_length - primer_length; // current beam's position in payload/codeword
                             let marker_region_ = (cw_idx_ % marker_block_length) >= marker_interval;
+                            new_syndrome_state = 0;
 
-                            if marker_region_ == true {
-                                new_syndrome_state = syndrome_state;
-                            }
-                            else{
-                                new_syndrome_state = 0;
-                            }
                         }
                         // a blank occurred before, so start a new occurrence of the same label (like a ␣ a).
                         let new_node_idx = suffix_tree.get_child(node, label).or_else(|| {
@@ -1588,13 +1590,7 @@ pub fn marker_beam_search_log<D: Data<Elem = f32>>(
                         //println!("DEBUG: line 1209 About to update syndrome state");
                         let cw_idx_ = sequence_length - primer_length; // current beam's position in payload/codeword
                         let marker_region_ = (cw_idx_ % marker_block_length) >= marker_interval;
-
-                        if marker_region_ == true {
-                            new_syndrome_state = syndrome_state;
-                        }
-                        else{
-                            new_syndrome_state = 0;
-                        }
+                        new_syndrome_state = 0;
                         //println!("DEBUG:   Updated syndrome_state: {} -> {}", syndrome_state, new_syndrome_state);
                     }
                     //println!("line 1218");
@@ -2073,9 +2069,18 @@ pub fn marker_beam_search_log_track<D: Data<Elem = f32>>(
         for j in 1..4{
             prob_sum = log_sum_exp(base_prob_acc[i][j], prob_sum);
         }
-        for j in 0..4{
+        if prob_sum == f32::NEG_INFINITY {
+        // If no path reached this position, set to uniform probability (0.25)
+        let log_025 = 0.25f32.ln();
+        for j in 0..4 {
+            base_prob_acc[i][j] = log_025;
+        }
+    } else {
+        // Normal normalization
+        for j in 0..4 {
             base_prob_acc[i][j] -= prob_sum;
         }
+    }
     }
     let payload_probs: Vec<[f32; 4]> = base_prob_acc[primer_length..primer_length + payload_length]
         .to_vec();
@@ -2083,6 +2088,349 @@ pub fn marker_beam_search_log_track<D: Data<Elem = f32>>(
     // Change the return type and statement:
     Ok((final_seq, final_score, payload_probs))
 }
+
+pub fn beam_search_log_with_base_probabilities<D: Data<Elem = f32>>(
+    network_output: &ArrayBase<D, Ix2>,
+    alphabet: &[String],
+    beam_size: usize,
+    beam_cut_threshold: f32,
+    collapse_repeats: bool,
+    forward_primer: &[usize],       // Forward primer sequence (nominally 25 bases, but we can also feed longer sequences)
+    reverse_primer: &[usize],       // Reverse primer sequence (25 bases)
+    offset_sequence: &[usize],      // Offset sequence for payload calculation
+) -> Result<(String, f32, Vec<[f32; 4]>), ConvSearchError> {
+
+    // both primers must have same length
+    let primer_length_f = forward_primer.len();
+    let primer_length_b = reverse_primer.len();
+    let payload_length = offset_sequence.len();
+    let total_length = primer_length_f + payload_length + primer_length_b;
+    let mut total_score_computations: u64 = 0;
+
+    /*println!("=== Starting marker_beam_search_log_track ===");
+    println!("Network output shape: {:?}", network_output.dim());
+    println!("Beam size: {}, Beam cut threshold: {}", beam_size, beam_cut_threshold);
+    println!("Collapse repeats: {}", collapse_repeats);
+    println!("Primer length: {}, Payload length: {}, Total target length: {}",
+           primer_length, payload_length, total_length);
+    println!("Forward primer: {:?}", forward_primer);
+    println!("Reverse primer: {:?}", reverse_primer);
+    println!("Offset sequence: {:?}", offset_sequence);*/
+
+    let mut base_prob_acc =  vec![[f32::NEG_INFINITY; 4]; total_length];
+
+    let alphabet_size = alphabet.len() - 1; // alphabet size minus the blank label
+    let log_beam_cut_threshold = beam_cut_threshold.ln();
+
+    let mut suffix_tree = SuffixTree::new(alphabet_size); // tracks partial sequences
+    let first_base = forward_primer[0];
+    let init_prob = network_output[[0, first_base + 1]];
+    let first_node_idx = suffix_tree
+        .get_child(ROOT_NODE, first_base)
+        .unwrap_or_else(|| suffix_tree.add_node(ROOT_NODE, first_base, 0));
+
+    let mut beam = vec![ConvSearchPointLog {
+        node: first_node_idx,
+        state: 0,
+        log_gap_prob: f32::NEG_INFINITY,  // ln(1.0) = 0.0
+        log_label_prob: init_prob.ln(),  // ln(0.0) = -inf
+        sequence_length: 1 as usize,
+        syndrome_state: 0,  // Start in syndrome state 0
+    }];
+    //println!(" First beam {}: Tip label {}, score: {}", first_node_idx, alphabet[first_base+1], init_prob.ln());
+
+    let mut next_beam = Vec::new();
+
+    // to track best beam of target length
+    let mut best_complete: Option<ConvSearchPointLog> = None;
+
+    for (time_idx, pr) in network_output.outer_iter().enumerate() {
+        // For each time step and its probability distribution
+        if time_idx == 0 {
+            continue;
+        }
+        next_beam.clear();
+
+        for (beam_idx, &search_point) in beam.iter().enumerate() {
+            let ConvSearchPointLog {
+                node,
+                state,
+                log_gap_prob,
+                log_label_prob,
+                sequence_length,
+                syndrome_state,
+            } = search_point;
+
+            if sequence_length == total_length {
+                continue; // no extension
+            }
+
+            let tip_label = suffix_tree.label(node);
+
+            // Add blank/gap transition
+            // add N to beam
+            let log_pr_blank = pr[0].ln();
+            if log_pr_blank > log_beam_cut_threshold {
+                total_score_computations += 1;
+                next_beam.push(ConvSearchPointLog {
+                    node: node,
+                    state: state,
+                    log_label_prob: f32::NEG_INFINITY,
+                    log_gap_prob: log_sum_exp(log_label_prob, log_gap_prob) + log_pr_blank,
+                    sequence_length: sequence_length,
+                    syndrome_state: syndrome_state,
+                });
+                //println!("Time idx {}: adding blank to beam id {} with tip label {:?}, score: {}", time_idx, node, tip_label.map(|l| &alphabet[l + 1]), (log_sum_exp(log_label_prob, log_gap_prob) + log_pr_blank));
+            }
+
+            // ======= Determine valid base extensions based on current position =====
+            let mut offset = 0;
+            let mut valid_bases = Vec::new();
+            let mut num_valid_bases = 0 as f32;
+            if sequence_length < primer_length_f { // in forward primer region
+                valid_bases = vec![forward_primer[sequence_length]];
+                num_valid_bases = 1 as f32;
+                //println!(" ---  Position {}: Forward primer region, valid base: {}", sequence_length, alphabet[valid_bases[0] + 1] );
+            }
+            else if sequence_length >= primer_length_f + payload_length { // in ending primer region
+                valid_bases = vec![reverse_primer[sequence_length - primer_length_f - payload_length]];
+                num_valid_bases = 1 as f32;
+                //println!(" --- Position {}: Reverse primer region, valid base: {}", sequence_length, alphabet[valid_bases[0]+1]);
+            }
+            else if sequence_length >= primer_length_f && sequence_length < primer_length_f + payload_length { // in payload region
+                let cw_idx = sequence_length - primer_length_f; // current beam's position in payload/codeword
+                valid_bases = vec![0,1,2,3];
+                num_valid_bases = 4 as f32;
+                //println!(" --- Position {}: non-marker region, valid bases: {:?}", sequence_length, valid_bases);
+
+                // since we're in payload region, apply offset to valid bases
+                offset = offset_sequence[sequence_length - primer_length_f];
+                for b in &mut valid_bases {
+                    *b = (*b + offset) % 4;
+                }
+                //println!("  Position {}: offset-adjusted valid bases: {:?}",sequence_length, valid_bases);
+            }
+            let log_num_valid_bases = num_valid_bases.ln();
+            // ==========================================================================
+
+            // Add label transitions
+            for (label, &pr_b) in pr.iter().skip(1).enumerate() {
+                let log_pr_b = pr_b.ln();
+                if log_pr_b < log_beam_cut_threshold {
+                    continue;
+                }
+
+                // Calculate new syndrome state and sequence length
+                let new_sequence_length = sequence_length + 1;
+                let mut new_syndrome_state = 0;
+
+                // Same label as current tip - handle repeat collapse
+                if collapse_repeats && Some(label) == tip_label {
+                    //println!("DEBUG:   Repeat collapse case - tip_label={:?}", tip_label);
+                    // Handle repeat collapse (dwelling)
+                    // "don't double-count repeats"
+                    total_score_computations += 1;
+                    next_beam.push(ConvSearchPointLog {
+                        node: node,
+                        log_label_prob: log_label_prob + log_pr_b,
+                        log_gap_prob: f32::NEG_INFINITY,
+                        state: state,
+                        sequence_length: sequence_length, // preserve the old sequence length & syndrome state (dwelling)
+                        syndrome_state: syndrome_state,
+                    });
+                    //println!("Time idx {}: beam id {} dwells at tip label {:?}, score: {}, seq length {}", time_idx, node, tip_label.map(|l| &alphabet[l + 1]), log_label_prob + log_pr_b, sequence_length);
+
+                    if valid_bases.contains(&label){
+                        if sequence_length >= primer_length_f && sequence_length < primer_length_f + payload_length {
+
+                            let cw_idx_ = sequence_length - primer_length_f; // current beam's position in payload/codeword
+                            new_syndrome_state = 0;
+                        }
+                        // a blank occurred before, so start a new occurrence of the same label (like a ␣ a).
+                        let new_node_idx = suffix_tree.get_child(node, label).or_else(|| {
+                            if log_gap_prob > f32::NEG_INFINITY {
+                                //println!("DEBUG:   Creating new node via gap transition");
+                                Some(suffix_tree.add_node(node, label, time_idx))
+                            } else {
+                                //println!("DEBUG:   No gap transition available (log_gap_prob=-inf)");
+                                None
+                            }
+                        });
+
+                        if let Some(idx) = new_node_idx {
+
+                            total_score_computations += 1;
+                            next_beam.push(ConvSearchPointLog {
+                                node: idx,
+                                state: state,
+                                log_label_prob: log_gap_prob + log_pr_b - log_num_valid_bases,
+                                log_gap_prob: f32::NEG_INFINITY,
+                                sequence_length: new_sequence_length, // transition via blank character implies an extension
+                                syndrome_state: new_syndrome_state,
+                            });
+                            //println!("Time idx {}: beam id {} extends tip label {:?} by label {}, score: {} seq length {}", time_idx, idx, tip_label.map(|l| &alphabet[l + 1]), alphabet[label + 1], log_gap_prob + log_pr_b - log_num_valid_bases, new_sequence_length);
+                            // =============== base probability tracking ===========================
+                            let emission_log_prob = log_sum_exp(log_label_prob, log_gap_prob) + log_pr_b;
+                            base_prob_acc[sequence_length][label] = log_sum_exp(emission_log_prob, base_prob_acc[sequence_length][label]);
+                            // =====================================================================
+
+                        }
+                    }
+                } else if valid_bases.contains(&label){
+                    //println!("DEBUG:   Normal extension case");
+                    if sequence_length >= primer_length_f && sequence_length < primer_length_f + payload_length {
+                        //println!("DEBUG: line 1209 About to update syndrome state");
+                        let cw_idx_ = sequence_length - primer_length_f; // current beam's position in payload/codeword
+                        new_syndrome_state = 0;
+                        //println!("DEBUG:   Updated syndrome_state: {} -> {}", syndrome_state, new_syndrome_state);
+                    }
+
+                    // Normal extension
+                    let new_node_idx = suffix_tree
+                        .get_child(node, label)
+                        .unwrap_or_else(|| suffix_tree.add_node(node, label, time_idx));
+
+                    let combined_log_prob = log_sum_exp(log_label_prob, log_gap_prob);
+                    total_score_computations += 1;
+                    next_beam.push(ConvSearchPointLog {
+                        node: new_node_idx,
+                        state: state,
+                        log_label_prob: combined_log_prob + log_pr_b - log_num_valid_bases,
+                        log_gap_prob: f32::NEG_INFINITY,
+                        sequence_length: new_sequence_length,
+                        syndrome_state: new_syndrome_state,
+                    });
+                    //println!("Time idx {}: beam id {} extends tip label {:?} by label {}, score: {} seq length {}", time_idx, new_node_idx, tip_label.map(|l| &alphabet[l + 1]), alphabet[label + 1], combined_log_prob + log_pr_b - log_num_valid_bases, new_sequence_length);
+                    // =============== base probability tracking ===========================
+                    let emission_log_prob = log_sum_exp(log_label_prob, log_gap_prob) + log_pr_b;
+                    base_prob_acc[sequence_length][label] = log_sum_exp(emission_log_prob, base_prob_acc[sequence_length][label]);
+                    // =====================================================================
+                }
+            }
+        } // dwelling/extension done
+
+        std::mem::swap(&mut beam, &mut next_beam);
+        //println!("  After extension: next_beam size = {}", beam.len());
+
+        // Merge identical paths (same node AND same syndrome state)
+        merge_identical_paths_log(&mut beam);
+
+        // >>> After merge, update the best completed beam based on UNNORMALIZED log probability
+        for &sp in &beam {
+            if sp.sequence_length == total_length {
+                let log_p = sp.log_probability();
+                let better = match best_complete {
+                    None => true,
+                    Some(prev) => log_p > prev.log_probability(),
+                };
+                if better {
+                    best_complete = Some(sp);
+                }
+            }
+        }
+
+        // Sort by log probability and prune
+        let mut has_nans = false;
+        beam.sort_unstable_by(|a, b| {
+            (b.log_probability())
+                .partial_cmp(&(a.log_probability()))
+                .unwrap_or_else(|| {
+                    has_nans = true;
+                    std::cmp::Ordering::Equal
+                })
+        });
+
+        if has_nans {
+            debug!("NaN detected in log probabilities!");
+            return Err(ConvSearchError::IncomparableValues);
+        }
+
+        beam.truncate(beam_size);
+
+        if beam.is_empty() {
+            debug!("All beams pruned -> error");
+            return Err(ConvSearchError::RanOutOfBeam);
+        }
+
+        // Note: Normalization in log domain would be subtracting the max log probability
+        // Commented out as in original:
+        /*let top_log = beam[0].log_probability();
+        for search_point in &mut beam {
+            search_point.log_label_prob -= top_log;
+            search_point.log_gap_prob -= top_log;
+        }*/
+    }
+
+    for &sp in &beam {
+        if sp.sequence_length == total_length {
+            let log_p = sp.log_probability();
+            let better = match best_complete {
+                None => true,
+                Some(prev) => log_p > prev.log_probability(),
+            };
+            if better {
+                best_complete = Some(sp);
+            }
+        }
+    }
+
+    // TODO do we need to ensure that the final beam has sequence_length = total_length?
+    let chosen_node = if let Some(best) = best_complete {
+        //debug!("Choosing saved best complete beam at node {}", best.node);
+        best.node
+    } else {
+        //debug!("No complete beam found; falling back to best partial (beam[0])");
+        beam[0].node
+    };
+
+    // Reconstruct the best path
+    let mut path = Vec::new();
+    let mut sequence = String::new();
+
+    if chosen_node != ROOT_NODE {
+        for (label, &time) in suffix_tree.iter_from(chosen_node) {
+            path.push(time);
+            sequence.push_str(&alphabet[label + 1]);
+        }
+    }
+
+    path.reverse();
+    let final_seq: String = sequence.chars().rev().collect();
+    //debug!("Final sequence: {}", final_seq);
+    //debug!("Final path: {:?}", path);
+
+    let final_score = if let Some(best) = best_complete {
+        best.log_probability()
+    } else {
+        beam[0].log_probability()
+    };
+
+    // normalize each column of base_prob_acc
+    for i in 0..total_length {
+        let mut prob_sum = base_prob_acc[i][0];
+        for j in 1..4{
+            prob_sum = log_sum_exp(base_prob_acc[i][j], prob_sum);
+        }
+        if prob_sum == f32::NEG_INFINITY {
+            // If no path reached this position, set to uniform probability (0.25)
+            let log_025 = 0.25f32.ln();
+            for j in 0..4 {
+                base_prob_acc[i][j] = log_025;
+            }
+        } else {
+            // Normal normalization
+            for j in 0..4 {
+                base_prob_acc[i][j] -= prob_sum;
+            }
+        }
+    }
+    let payload_probs: Vec<[f32; 4]> = base_prob_acc[primer_length_f..primer_length_f + payload_length]
+        .to_vec();
+
+    // Change the return type and statement:
+    Ok((final_seq, final_score, payload_probs))
+}
+
 
 // looks correct
 fn get_valid_bases(
