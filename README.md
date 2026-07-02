@@ -26,7 +26,7 @@ cd ..
 
 ```python
 >>> from fast_ctc_decode import primer_beam_search_opt as primer_beam_search
->>> from fast_ctc_decode import convolutional_beam_search_log, marker_beam_search_log_track
+>>> from fast_ctc_decode import convolutional_beam_search_log, marker_beam_search_log_track, beam_search_log_with_base_probabilities
 >>> import numpy as np
 >>> import json
 >>> alphabet = "NACGT"
@@ -121,4 +121,14 @@ cd ..
                                                     marker_interval=marker_interval,
                                                     marker_sequence_str=marker_sequence_str,
                                                 ) # seq should be 'ATACCTACG'
+>>> seq, score, base_probabilities = beam_search_log_with_base_probabilities(
+                                                    prob_matrix,
+                                                    alphabet,
+                                                    beam_size=5,
+                                                    beam_cut_threshold=0.0,
+                                                    collapse_repeats=True,
+                                                    forward_primer_str=forward_primer_str,
+                                                    reverse_primer_str=reverse_primer_str,
+                                                    offset_sequence_str=offset_sequence_str
+                                                )
 ```
