@@ -2241,11 +2241,7 @@ pub fn beam_search_log_with_base_probabilities<D: Data<Elem = f32>>(
                     //println!("Time idx {}: beam id {} dwells at tip label {:?}, score: {}, seq length {}", time_idx, node, tip_label.map(|l| &alphabet[l + 1]), log_label_prob + log_pr_b, sequence_length);
 
                     if valid_bases.contains(&label){
-                        if sequence_length >= primer_length_f && sequence_length < primer_length_f + payload_length {
 
-                            let cw_idx_ = sequence_length - primer_length_f; // current beam's position in payload/codeword
-                            new_syndrome_state = 0;
-                        }
                         // a blank occurred before, so start a new occurrence of the same label (like a ␣ a).
                         let new_node_idx = suffix_tree.get_child(node, label).or_else(|| {
                             if log_gap_prob > f32::NEG_INFINITY {
@@ -2278,13 +2274,6 @@ pub fn beam_search_log_with_base_probabilities<D: Data<Elem = f32>>(
                     }
                 } else if valid_bases.contains(&label){
                     //println!("DEBUG:   Normal extension case");
-                    if sequence_length >= primer_length_f && sequence_length < primer_length_f + payload_length {
-                        //println!("DEBUG: line 1209 About to update syndrome state");
-                        let cw_idx_ = sequence_length - primer_length_f; // current beam's position in payload/codeword
-                        new_syndrome_state = 0;
-                        //println!("DEBUG:   Updated syndrome_state: {} -> {}", syndrome_state, new_syndrome_state);
-                    }
-
                     // Normal extension
                     let new_node_idx = suffix_tree
                         .get_child(node, label)
@@ -2425,7 +2414,7 @@ pub fn beam_search_log_with_base_probabilities<D: Data<Elem = f32>>(
         }
     }
     let payload_probs: Vec<[f32; 4]> = base_prob_acc[primer_length_f..primer_length_f + payload_length]
-        .to_vec();
+        .to_vec(); // this step removes both primer regions from probability matrix
 
     // Change the return type and statement:
     Ok((final_seq, final_score, payload_probs))
